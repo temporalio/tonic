@@ -12,13 +12,16 @@ pub fn configure() -> Builder {
     Builder {
         build_client: true,
         build_server: true,
+        file_descriptor_set_path: None,
         out_dir: None,
         extern_path: Vec::new(),
         field_attributes: Vec::new(),
         type_attributes: Vec::new(),
         proto_path: "super".to_string(),
+        compile_well_known_types: false,
         #[cfg(feature = "rustfmt")]
         format: true,
+        emit_package: true,
     }
 }
 
@@ -92,8 +95,13 @@ impl crate::Method for Method {
         &self.comments.leading[..]
     }
 
-    fn request_response_name(&self, proto_path: &str) -> (TokenStream, TokenStream) {
-        let request = if self.input_proto_type.starts_with(".google.protobuf")
+    fn request_response_name(
+        &self,
+        proto_path: &str,
+        compile_well_known_types: bool,
+    ) -> (TokenStream, TokenStream) {
+        let request = if (self.input_proto_type.starts_with(".google.protobuf")
+            && !compile_well_known_types)
             || self.input_type.starts_with("::")
         {
             self.input_type.parse::<TokenStream>().unwrap()
@@ -103,7 +111,8 @@ impl crate::Method for Method {
                 .to_token_stream()
         };
 
-        let response = if self.output_proto_type.starts_with(".google.protobuf")
+        let response = if (self.output_proto_type.starts_with(".google.protobuf")
+            && !compile_well_known_types)
             || self.output_type.starts_with("::")
         {
             self.output_type.parse::<TokenStream>().unwrap()
@@ -136,12 +145,22 @@ impl ServiceGenerator {
 impl prost_build::ServiceGenerator for ServiceGenerator {
     fn generate(&mut self, service: prost_build::Service, _buf: &mut String) {
         if self.builder.build_server {
-            let server = server::generate(&service, &self.builder.proto_path);
+            let server = server::generate(
+                &service,
+                self.builder.emit_package,
+                &self.builder.proto_path,
+                self.builder.compile_well_known_types,
+            );
             self.servers.extend(server);
         }
 
         if self.builder.build_client {
-            let client = client::generate(&service, &self.builder.proto_path);
+            let client = client::generate(
+                &service,
+                self.builder.emit_package,
+                &self.builder.proto_path,
+                self.builder.compile_well_known_types,
+            );
             self.clients.extend(client);
         }
     }
@@ -180,10 +199,13 @@ impl prost_build::ServiceGenerator for ServiceGenerator {
 pub struct Builder {
     pub(crate) build_client: bool,
     pub(crate) build_server: bool,
+    pub(crate) file_descriptor_set_path: Option<PathBuf>,
     pub(crate) extern_path: Vec<(String, String)>,
     pub(crate) field_attributes: Vec<(String, String)>,
     pub(crate) type_attributes: Vec<(String, String)>,
     pub(crate) proto_path: String,
+    pub(crate) emit_package: bool,
+    pub(crate) compile_well_known_types: bool,
 
     out_dir: Option<PathBuf>,
     #[cfg(feature = "rustfmt")]
@@ -200,6 +222,13 @@ impl Builder {
     /// Enable or disable gRPC server code generation.
     pub fn build_server(mut self, enable: bool) -> Self {
         self.build_server = enable;
+        self
+    }
+
+    /// Generate a file containing the encoded `prost_types::FileDescriptorSet` for protocol buffers
+    /// modules. This is required for implementing gRPC Server Reflection.
+    pub fn file_descriptor_set_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.file_descriptor_set_path = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -258,6 +287,23 @@ impl Builder {
         self
     }
 
+    /// Emits GRPC endpoints with no attached package. Effectively ignores protofile package declaration from grpc context.
+    ///
+    /// This effectively sets prost's exported package to an empty string.
+    pub fn disable_package_emission(mut self) -> Self {
+        self.emit_package = false;
+        self
+    }
+
+    /// Enable or disable directing Prost to compile well-known protobuf types instead
+    /// of using the already-compiled versions available in the `prost-types` crate.
+    ///
+    /// This defaults to `false`.
+    pub fn compile_well_known_types(mut self, compile_well_known_types: bool) -> Self {
+        self.compile_well_known_types = compile_well_known_types;
+        self
+    }
+
     /// Compile the .proto files and execute code generation.
     pub fn compile<P>(self, protos: &[P], includes: &[P]) -> io::Result<()>
     where
@@ -287,6 +333,9 @@ impl Builder {
         let format = self.format;
 
         config.out_dir(out_dir.clone());
+        if let Some(path) = self.file_descriptor_set_path.as_ref() {
+            config.file_descriptor_set_path(path);
+        }
         for (proto_path, rust_path) in self.extern_path.iter() {
             config.extern_path(proto_path, rust_path);
         }
@@ -295,6 +344,9 @@ impl Builder {
         }
         for (prost_path, attr) in self.type_attributes.iter() {
             config.type_attribute(prost_path, attr);
+        }
+        if self.compile_well_known_types {
+            config.compile_well_known_types();
         }
         config.service_generator(Box::new(ServiceGenerator::new(self)));
 
